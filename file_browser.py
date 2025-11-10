@@ -1,6 +1,6 @@
 """
 File Browser Component
-Modern file browser for loading JSONL files with folder navigation
+Modern file browser for loading DuckDB and JSONL files with folder navigation
 """
 import pygame
 import os
@@ -35,9 +35,6 @@ class FileBrowser:
         self.folders = []
         self.hovered_index = -1
         
-        # Recent files
-        self.recent_files = self.load_recent_files()
-        
         # Buttons (positions will be updated in draw)
         self.load_button = Button(0, 0, 120, 35, "Load File", color=(76, 175, 80))
         self.cancel_button = Button(0, 0, 120, 35, "Cancel", color=(244, 67, 54))
@@ -45,33 +42,6 @@ class FileBrowser:
         self.up_button = Button(0, 0, 80, 30, "Up", color=(100, 100, 100))
         
         self.refresh_file_list()
-    
-    def load_recent_files(self):
-        """Load recent files from settings"""
-        try:
-            recent_path = 'incep/recent_files.json'
-            if os.path.exists(recent_path):
-                with open(recent_path, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-        return []
-    
-    def save_recent_files(self):
-        """Save recent files to settings"""
-        try:
-            os.makedirs('incep', exist_ok=True)
-            with open('incep/recent_files.json', 'w') as f:
-                json.dump(self.recent_files[:10], f)
-        except Exception as e:
-            print(f"Error saving recent files: {e}")
-    
-    def add_recent_file(self, filepath):
-        """Add file to recent files list"""
-        if filepath in self.recent_files:
-            self.recent_files.remove(filepath)
-        self.recent_files.insert(0, filepath)
-        self.save_recent_files()
     
     def refresh_file_list(self):
         """Refresh the file and folder list"""
@@ -85,11 +55,12 @@ class FileBrowser:
                 full_path = os.path.join(self.current_path, item)
                 if os.path.isdir(full_path):
                     self.folders.append(item)
-                elif item.endswith('.jsonl') or item.endswith('.json'):
+                elif item.endswith(('.jsonl', '.json', '.duckdb')):
                     self.files.append(item)
             
             self.folders.sort()
-            self.files.sort()
+            # Sort files with .duckdb first
+            self.files.sort(key=lambda f: (0 if f.endswith('.duckdb') else 1, f))
             
         except Exception as e:
             print(f"Error reading directory: {e}")
@@ -100,9 +71,8 @@ class FileBrowser:
     def calculate_max_scroll(self):
         """Calculate maximum scroll based on content"""
         item_height = 35
-        recent_height = (len(self.recent_files[:5]) + 2) * item_height if self.recent_files else 0
         total_items = len(self.folders) + len(self.files)
-        content_height = recent_height + total_items * item_height
+        content_height = total_items * item_height
         visible_height = self.height - 200
         self.max_scroll_y = max(0, content_height - visible_height)
     
@@ -174,37 +144,6 @@ class FileBrowser:
         
         current_y = list_rect.y + 10 - self.scroll_y
         
-        # Draw recent files
-        if self.recent_files:
-            recent_label = self.font.render("Recent Files:", True, (100, 100, 100))
-            surface.blit(recent_label, (list_rect.x + 10, current_y))
-            current_y += 30
-            
-            for i, recent_file in enumerate(self.recent_files[:5]):
-                if current_y > list_rect.bottom or current_y + 35 < list_rect.top:
-                    current_y += 35
-                    continue
-                
-                item_rect = pygame.Rect(list_rect.x + 10, current_y, list_rect.width - 20, 30)
-                
-                if self.hovered_index == -(i + 1):
-                    pygame.draw.rect(surface, (230, 240, 255), item_rect, border_radius=3)
-                
-                icon_text = self.font.render("📄", True, (100, 150, 255))
-                surface.blit(icon_text, (item_rect.x + 5, item_rect.y + 5))
-                
-                file_name = os.path.basename(recent_file)
-                name_text = self.font.render(file_name[:50], True, (60, 60, 60))
-                surface.blit(name_text, (item_rect.x + 30, item_rect.y + 7))
-                
-                current_y += 35
-            
-            current_y += 10
-            pygame.draw.line(surface, (220, 220, 220),
-                           (list_rect.x + 10, current_y),
-                           (list_rect.x + list_rect.width - 10, current_y), 1)
-            current_y += 20
-        
         # Draw folders
         for i, folder in enumerate(self.folders):
             if current_y > list_rect.bottom or current_y + 35 < list_rect.top:
@@ -212,9 +151,6 @@ class FileBrowser:
                 continue
             
             item_rect = pygame.Rect(list_rect.x + 10, current_y, list_rect.width - 20, 30)
-            
-            if self.hovered_index == i:
-                pygame.draw.rect(surface, (240, 240, 240), item_rect, border_radius=3)
             
             icon_text = self.font.render("📁", True, (255, 200, 100))
             surface.blit(icon_text, (item_rect.x + 5, item_rect.y + 5))
@@ -232,11 +168,6 @@ class FileBrowser:
             
             item_rect = pygame.Rect(list_rect.x + 10, current_y, list_rect.width - 20, 30)
             file_index = len(self.folders) + i
-            
-            if self.hovered_index == file_index:
-                pygame.draw.rect(surface, (230, 240, 255), item_rect, border_radius=3)
-            elif self.selected_file == file:
-                pygame.draw.rect(surface, (200, 220, 255), item_rect, border_radius=3)
             
             icon_text = self.font.render("📄", True, (100, 150, 255))
             surface.blit(icon_text, (item_rect.x + 5, item_rect.y + 5))
@@ -292,27 +223,12 @@ class FileBrowser:
         
         if self.load_button.click(pos) and self.selected_file:
             file_path = os.path.join(self.current_path, self.selected_file)
-            self.add_recent_file(file_path)
             return file_path
         
         # Check file list clicks
         list_rect = pygame.Rect(x + 20, y + 130, self.width - 40, self.height - 200)
         if list_rect.collidepoint(pos):
             relative_y = pos[1] - list_rect.y + self.scroll_y - 10
-            
-            # Check recent files
-            if self.recent_files:
-                recent_section_height = (len(self.recent_files[:5]) + 2) * 35
-                if relative_y < recent_section_height:
-                    index = int((relative_y - 30) / 35)
-                    if 0 <= index < len(self.recent_files[:5]):
-                        file_path = self.recent_files[index]
-                        if os.path.exists(file_path):
-                            self.add_recent_file(file_path)
-                            return file_path
-                    return None
-                relative_y -= recent_section_height
-            
             item_index = int(relative_y / 35)
             
             if item_index < len(self.folders):
@@ -337,16 +253,6 @@ class FileBrowser:
         list_rect = pygame.Rect(x + 20, y + 130, self.width - 40, self.height - 200)
         if list_rect.collidepoint(pos):
             relative_y = pos[1] - list_rect.y + self.scroll_y - 10
-            
-            if self.recent_files:
-                recent_section_height = (len(self.recent_files[:5]) + 2) * 35
-                if relative_y < recent_section_height:
-                    index = int((relative_y - 30) / 35)
-                    if 0 <= index < len(self.recent_files[:5]):
-                        self.hovered_index = -(index + 1)
-                        return
-                relative_y -= recent_section_height
-            
             item_index = int(relative_y / 35)
             if 0 <= item_index < len(self.folders) + len(self.files):
                 self.hovered_index = item_index

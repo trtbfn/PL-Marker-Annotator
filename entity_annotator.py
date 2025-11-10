@@ -8,6 +8,7 @@ import math
 import random
 from collections import deque
 from typing import List, Dict, Tuple, Optional
+import os
 
 # Handle both relative and absolute imports
 try:
@@ -18,14 +19,20 @@ try:
         load_settings, save_settings, load_history, save_history,
         load_jsonl, save_jsonl, generate_random_color, normalize_type
     )
+    from . import config as cfg
+    from .db_manager import AnnotationDatabase
 except ImportError:
     from ui_components import Button, Popup, InputDialog
     from file_browser import FileBrowser
     from navigation import NavigationBar, ShortcutHelp
     from utils import (
-        load_settings, save_settings, load_history, save_history,
-        load_jsonl, save_jsonl, generate_random_color, normalize_type
+        generate_random_color, normalize_type
     )
+    import config as cfg
+    try:
+        from db_manager import AnnotationDatabase
+    except ImportError:
+        AnnotationDatabase = None  # DuckDB not available
 
 
 class EntityAnnotator:
@@ -35,34 +42,72 @@ class EntityAnnotator:
         # Initialize pygame
         pygame.init()
         
-        # Window setup
-        self.width = 1200
-        self.height = 800
+        # Window setup with config
+        self.width = cfg.DEFAULT_WINDOW_WIDTH
+        self.height = cfg.DEFAULT_WINDOW_HEIGHT
         self.screen = pygame.display.set_mode((self.width, self.height), pygame.RESIZABLE)
-        pygame.display.set_caption("Entity Annotator - Enhanced")
+        pygame.display.set_caption(cfg.WINDOW_TITLE)
+        
+        # Set custom icon (simple annotation icon)
+        try:
+            icon_surface = pygame.Surface((32, 32))
+            icon_surface.fill((255, 255, 255))
+            # Draw a simple "A" icon for Annotator
+            pygame.draw.rect(icon_surface, (63, 81, 181), (4, 4, 24, 24), border_radius=4)
+            font = pygame.font.SysFont('Arial', 20, bold=True)
+            text = font.render('A', True, (255, 255, 255))
+            text_rect = text.get_rect(center=(16, 16))
+            icon_surface.blit(text, text_rect)
+            pygame.display.set_icon(icon_surface)
+        except:
+            pass  # If icon creation fails, use default
+        
         self.clock = pygame.time.Clock()
         
-        # Load fonts
-        self.font = pygame.font.SysFont('Arial', 18)
-        self.small_font = pygame.font.SysFont('Arial', 14)
-        self.bold_font = pygame.font.SysFont('Arial', 18, bold=True)
+        # Load fonts with fallback
+        font_family = cfg.FONT_FAMILY
+        try:
+            self.font = pygame.font.SysFont(font_family, cfg.FONT_SIZE_NORMAL)
+            self.small_font = pygame.font.SysFont(font_family, cfg.FONT_SIZE_SMALL)
+            self.tiny_font = pygame.font.SysFont(font_family, cfg.FONT_SIZE_TINY)
+            self.bold_font = pygame.font.SysFont(font_family, cfg.FONT_SIZE_NORMAL, bold=True)
+            self.title_font = pygame.font.SysFont(font_family, cfg.FONT_SIZE_TITLE, bold=True)
+        except:
+            # Fallback to Arial
+            self.font = pygame.font.SysFont(cfg.FONT_FAMILY_FALLBACK, cfg.FONT_SIZE_NORMAL)
+            self.small_font = pygame.font.SysFont(cfg.FONT_FAMILY_FALLBACK, cfg.FONT_SIZE_SMALL)
+            self.tiny_font = pygame.font.SysFont(cfg.FONT_FAMILY_FALLBACK, cfg.FONT_SIZE_TINY)
+            self.bold_font = pygame.font.SysFont(cfg.FONT_FAMILY_FALLBACK, cfg.FONT_SIZE_NORMAL, bold=True)
+            self.title_font = pygame.font.SysFont(cfg.FONT_FAMILY_FALLBACK, cfg.FONT_SIZE_TITLE, bold=True)
         
-        # Load settings
-        self.settings = load_settings()
-        self.entity_colors = self.settings["entity_colors"]
-        self.relation_colors = self.settings["relation_colors"]
+        # Default colors (no persistent settings)
+        self.entity_colors = {}
+        self.relation_colors = {}
+        self.settings = {
+            "known_entities": [],
+            "known_relations": [],
+            "custom_entities": [],
+            "custom_relations": []
+        }
         
-        # Document data
-        self.document_collection = []
+        # Document data (DuckDB only)
         self.current_doc_index = 0
         self.doc = {"sentences": [], "ner": [], "relations": []}
         self.doc_id = None
         self.current_file_path = None
         
+        # Database
+        self.database = None
+        self.doc_ids = []  # List of document IDs
+        
         # UI State
-        self.status_message = "Press Ctrl+O to open a file"
+        self.status_message = cfg.STATUS_DEFAULT
         self.save_status = ""
         self.save_status_time = 0
+        
+        # Smooth scrolling
+        self.target_scroll_y = 0
+        self.current_scroll_velocity = 0
         
         # Annotation state
         self.is_selecting = False
@@ -87,10 +132,9 @@ class EntityAnnotator:
         self.hovered_entity_key = None
         self.e_key_held = False
         
-        # History
-        undo_list, redo_list = load_history()
-        self.undo_stack = deque(undo_list, maxlen=25)
-        self.redo_stack = deque(redo_list, maxlen=25)
+        # History (no persistence)
+        self.undo_stack = deque(maxlen=cfg.MAX_UNDO_HISTORY)
+        self.redo_stack = deque(maxlen=cfg.MAX_UNDO_HISTORY)
         
         # Rendering data
         self.rendered_entities = []
@@ -102,61 +146,75 @@ class EntityAnnotator:
         # Scrolling
         self.doc_scroll_y = 0
         self.max_scroll_y = 0
-        self.doc_container = pygame.Rect(10, 160, self.width - 20, self.height - 170)
+        
+        # Document container with config-based layout
+        toolbar_bottom = cfg.TOOLBAR_HEIGHT + cfg.NAV_BAR_HEIGHT + cfg.NAV_BAR_MARGIN * 2
+        self.doc_container = pygame.Rect(
+            cfg.DOC_CONTAINER_MARGIN, 
+            toolbar_bottom,
+            self.width - cfg.DOC_CONTAINER_MARGIN * 2, 
+            self.height - toolbar_bottom - cfg.DOC_CONTAINER_MARGIN
+        )
         
         # Initialize UI components
         self.setup_ui()
         
-        # Load initial file if exists
-        default_file = 'incep/combined_scier_hyperpie_train.jsonl'
+        # Deferred file loading (after first frame to prevent freeze)
+        self.pending_file_load = None
+        default_file = 'combined_scier_hyperpie_test.jsonl'
         if hasattr(sys, 'argv') and len(sys.argv) > 1:
-            self.load_file(sys.argv[1])
-        elif self.file_browser.recent_files:
-            # Try to load most recent file
-            try:
-                self.load_file(self.file_browser.recent_files[0])
-            except:
-                pass
+            self.pending_file_load = sys.argv[1]
+        elif os.path.exists(default_file):
+            self.pending_file_load = default_file
     
     def setup_ui(self):
-        """Initialize all UI components"""
-        button_width = 150
-        button_height = 30
-        button_margin = 10
-        toolbar_y = 50
+        """Initialize all UI components with modern styling"""
+        button_width = cfg.BUTTON_WIDTH
+        button_height = cfg.BUTTON_HEIGHT
+        button_margin = cfg.BUTTON_MARGIN
+        toolbar_y = cfg.TOOLBAR_PADDING + 35  # Below title
         
-        # Toolbar buttons
-        self.undo_button = Button(10, toolbar_y, button_width, button_height, "Undo (Ctrl+Z)")
+        # Toolbar buttons with modern colors
+        x_pos = cfg.TOOLBAR_PADDING
+        
+        self.undo_button = Button(x_pos, toolbar_y, button_width, button_height, "Undo",
+                                  color=cfg.COLOR_SECONDARY, hover_color=cfg.COLOR_SECONDARY_HOVER)
         self.undo_button.is_disabled = len(self.undo_stack) == 0
+        x_pos += button_width + button_margin
         
-        self.redo_button = Button(10 + (button_width + button_margin), toolbar_y, 
-                                  button_width, button_height, "Redo (Ctrl+Y)")
+        self.redo_button = Button(x_pos, toolbar_y, button_width, button_height, "Redo",
+                                  color=cfg.COLOR_SECONDARY, hover_color=cfg.COLOR_SECONDARY_HOVER)
         self.redo_button.is_disabled = len(self.redo_stack) == 0
+        x_pos += button_width + button_margin
         
-        self.save_button = Button(10 + 2 * (button_width + button_margin), toolbar_y, 
-                                  button_width, button_height, "Save (Ctrl+S)",
-                                  color=(76, 175, 80), hover_color=(56, 142, 60))
+        self.save_button = Button(x_pos, toolbar_y, button_width, button_height, "Save",
+                                  color=cfg.COLOR_SUCCESS, hover_color=cfg.COLOR_SUCCESS_HOVER)
+        x_pos += button_width + button_margin
         
-        self.open_file_button = Button(10 + 3 * (button_width + button_margin), toolbar_y,
-                                       button_width, button_height, "Open File (Ctrl+O)",
-                                       color=(63, 81, 181), hover_color=(48, 63, 159))
+        self.open_file_button = Button(x_pos, toolbar_y, button_width, button_height, "Open File",
+                                       color=cfg.COLOR_PRIMARY, hover_color=cfg.COLOR_PRIMARY_HOVER)
+        x_pos += button_width + button_margin
         
-        self.add_entity_type_button = Button(10 + 4 * (button_width + button_margin), toolbar_y,
-                                             button_width, button_height, "Add Entity Type",
-                                             color=(156, 39, 176), hover_color=(123, 31, 162))
+        self.add_entity_type_button = Button(x_pos, toolbar_y, button_width, button_height, "+ Entity",
+                                             color=cfg.COLOR_INFO, hover_color=cfg.COLOR_INFO_HOVER)
+        x_pos += button_width + button_margin
         
-        self.add_relation_type_button = Button(10 + 5 * (button_width + button_margin), toolbar_y,
-                                               button_width, button_height, "Add Relation Type",
-                                               color=(156, 39, 176), hover_color=(123, 31, 162))
+        self.add_relation_type_button = Button(x_pos, toolbar_y, button_width, button_height, "+ Relation",
+                                               color=cfg.COLOR_INFO, hover_color=cfg.COLOR_INFO_HOVER)
         
         # Navigation buttons
         nav_y = toolbar_y + button_height + button_margin
-        self.prev_doc_button = Button(10, nav_y, button_width, button_height, "◀ Prev",
-                                      color=(158, 158, 158), hover_color=(117, 117, 117))
+        self.prev_doc_button = Button(cfg.TOOLBAR_PADDING, nav_y, button_width, button_height, "Previous",
+                                      color=cfg.COLOR_SECONDARY, hover_color=cfg.COLOR_SECONDARY_HOVER)
         
-        self.next_doc_button = Button(10 + button_width + button_margin, nav_y,
-                                      button_width, button_height, "Next ▶",
-                                      color=(158, 158, 158), hover_color=(117, 117, 117))
+        self.next_doc_button = Button(cfg.TOOLBAR_PADDING + button_width + button_margin, nav_y,
+                                      button_width, button_height, "Next",
+                                      color=cfg.COLOR_SECONDARY, hover_color=cfg.COLOR_SECONDARY_HOVER)
+        
+        # Export button
+        x_pos = cfg.TOOLBAR_PADDING + (button_width + button_margin) * 2
+        self.export_button = Button(x_pos, nav_y, button_width, button_height, "Export JSONL",
+                                    color=cfg.COLOR_SUCCESS, hover_color=cfg.COLOR_SUCCESS_HOVER)
         
         # Popups
         self.entity_popup = Popup(300, 300, 250, 400, "Select Entity Type")
@@ -171,105 +229,314 @@ class EntityAnnotator:
         
         self.input_dialog = InputDialog(300, 300, 350, 180, "Add New Type")
         
-        # New components
+        # New components with config-based layout
         self.file_browser = FileBrowser(width=900, height=600)
-        self.navigation_bar = NavigationBar(10, 125, self.width - 20, 30)
+        nav_bar_y = cfg.TOOLBAR_HEIGHT + cfg.NAV_BAR_MARGIN
+        self.navigation_bar = NavigationBar(cfg.TOOLBAR_PADDING, nav_bar_y, 
+                                           self.width - cfg.TOOLBAR_PADDING * 2, 
+                                           cfg.NAV_BAR_HEIGHT)
         self.shortcut_help = ShortcutHelp()
     
     def load_file(self, file_path: str) -> bool:
-        """Load annotations from a JSONL file"""
+        """Load annotations from DuckDB or create from JSONL"""
         try:
             if not file_path:
                 return False
             
-            self.document_collection = load_jsonl(file_path)
+            # If it's a JSONL file, convert to DuckDB
+            if file_path.endswith('.jsonl'):
+                db_path = file_path.replace('.jsonl', '.duckdb')
+                
+                # Always create/recreate database from JSONL
+                if os.path.exists(db_path):
+                    self.status_message = f"Loading existing database..."
+                    return self.load_from_database(db_path)
+                else:
+                    self.status_message = f"Creating database from JSONL..."
+                    return self.import_and_use_database(file_path, db_path)
             
-            if not self.document_collection:
-                self.status_message = "Error: No documents found in file"
+            # If it's already a DuckDB file, load it directly
+            elif file_path.endswith('.duckdb'):
+                return self.load_from_database(file_path)
+            
+            else:
+                self.status_message = "Error: Only .jsonl and .duckdb files supported"
                 return False
-            
-            self.current_file_path = file_path
-            self.load_document(0)
-            self.extract_and_save_entity_types()
-            
-            self.save_status = f"Loaded {len(self.document_collection)} documents"
-            self.save_status_time = pygame.time.get_ticks()
-            self.status_message = f"Loaded: {file_path}"
-            
-            return True
             
         except Exception as e:
             self.status_message = f"Error loading file: {str(e)}"
             print(f"Error loading file: {e}")
             return False
     
-    def load_document(self, index: int):
-        """Load document at specified index"""
-        if 0 <= index < len(self.document_collection):
-            self.current_doc_index = index
-            doc = self.document_collection[index]
-            
-            self.doc_id = doc.get("doc_id", f"doc_{index}")
-            self.doc["sentences"] = doc.get("sentences", [])
-            self.doc["ner"] = doc.get("ner", [])
-            self.doc["relations"] = doc.get("relations", [])
-            
-            # Update navigation buttons
-            self.prev_doc_button.is_disabled = (index == 0)
-            self.next_doc_button.is_disabled = (index == len(self.document_collection) - 1)
-            
-            # Reset scroll and state
-            self.doc_scroll_y = 0
-            self.selected_entities = []
-            self.selected_tokens = []
-            self.selected_entity_labels = {}
-            
-            self.render_document()
-            self.status_message = f"Document {index + 1}/{len(self.document_collection)}"
-    
-    def save_current_document(self):
-        """Save current document back to collection"""
-        if self.current_doc_index < len(self.document_collection):
-            self.document_collection[self.current_doc_index]["sentences"] = self.doc["sentences"]
-            self.document_collection[self.current_doc_index]["ner"] = self.doc["ner"]
-            self.document_collection[self.current_doc_index]["relations"] = self.doc["relations"]
-    
-    def save_annotations(self) -> bool:
-        """Save all annotations to file"""
+    def import_and_use_database(self, jsonl_path: str, db_path: str) -> bool:
+        """Import JSONL into database"""
         try:
-            if not self.current_file_path or not self.document_collection:
-                self.save_status = "No file loaded to save"
-                self.save_status_time = pygame.time.get_ticks()
-                return False
+            # Show import progress
+            self.draw_progress_bar(0.0, "Creating database...")
             
-            self.save_current_document()
-            save_jsonl(self.document_collection, self.current_file_path)
+            self.database = AnnotationDatabase(db_path)
             
-            self.save_status = "Saved successfully!"
+            # Create progress callback that updates UI
+            def import_progress(progress, message):
+                self.draw_progress_bar(progress, message)
+                pygame.event.pump()  # Keep window responsive
+            
+            self.draw_progress_bar(0.3, "Starting import...")
+            count = self.database.import_from_jsonl(jsonl_path, progress_callback=import_progress)
+            
+            self.draw_progress_bar(0.6, "Indexing database...")
+            pygame.event.pump()
+            
+            self.current_file_path = db_path
+            self.doc_ids = self.database.get_document_ids()
+            
+            if self.doc_ids:
+                self.draw_progress_bar(0.8, "Loading first document...")
+                pygame.event.pump()
+                self.load_document(0)
+                self.extract_and_save_entity_types(scan_all_docs=True)
+            
+            self.save_status = f"✓ Imported {count} documents to database"
             self.save_status_time = pygame.time.get_ticks()
-            save_history(self.undo_stack, self.redo_stack)
+            self.status_message = f"Using database: {db_path}"
             
             return True
         except Exception as e:
-            self.save_status = f"Error: {str(e)}"
+            self.status_message = f"Database import failed: {e}"
+            print(f"Database import failed: {e}")
+            return False
+    
+    def load_from_database(self, db_path: str) -> bool:
+        """Load from existing database"""
+        try:
+            self.draw_progress_bar(0.0, "Opening database...")
+            pygame.event.pump()
+            
+            self.database = AnnotationDatabase(db_path)
+            
+            self.draw_progress_bar(0.3, "Loading document list...")
+            pygame.event.pump()
+            
+            self.current_file_path = db_path
+            self.doc_ids = self.database.get_document_ids()
+            
+            if self.doc_ids:
+                self.draw_progress_bar(0.5, "Loading first document...")
+                pygame.event.pump()
+                self.load_document(0)
+                self.extract_and_save_entity_types(scan_all_docs=True)
+            
+            count = len(self.doc_ids)
+            self.save_status = f"✓ Loaded database ({count} documents)"
+            self.save_status_time = pygame.time.get_ticks()
+            self.status_message = f"Using database: {db_path}"
+            
+            return True
+        except Exception as e:
+            print(f"Database load failed: {e}")
+            return False
+    
+    def load_document(self, index: int):
+        """Load document at specified index from database"""
+        if 0 <= index < len(self.doc_ids):
+            self.current_doc_index = index
+            doc = self.database.get_document(self.doc_ids[index])
+            
+            if doc:
+                self.doc_id = doc.get("doc_id", f"doc_{index}")
+                self.doc["sentences"] = doc.get("sentences", [])
+                self.doc["ner"] = doc.get("ner", [])
+                self.doc["relations"] = doc.get("relations", [])
+                
+                # Update navigation buttons
+                self.prev_doc_button.is_disabled = (index == 0)
+                self.next_doc_button.is_disabled = (index == len(self.doc_ids) - 1)
+                
+                # Reset scroll and state
+                self.doc_scroll_y = 0
+                self.target_scroll_y = 0
+                self.selected_entities = []
+                self.selected_tokens = []
+                self.selected_entity_labels = {}
+                
+                self.render_document()
+                self.status_message = f"Document {index + 1}/{len(self.doc_ids)}"
+    
+    def save_annotations(self, show_immediate_feedback=False) -> bool:
+        """Save annotations to database"""
+        try:
+            if not self.current_file_path:
+                self.save_status = "✗ No file loaded to save"
+                self.save_status_time = pygame.time.get_ticks()
+                return False
+            
+            # Show immediate feedback if requested (for manual saves)
+            if show_immediate_feedback:
+                self.save_status = "Saving..."
+                self.save_status_time = pygame.time.get_ticks()
+                self.draw()
+                pygame.display.flip()
+                pygame.event.pump()  # Keep responsive
+            
+            # Save current document to database
+            doc_to_save = {
+                'doc_id': self.doc_id,
+                'sentences': self.doc["sentences"],
+                'ner': self.doc["ner"],
+                'relations': self.doc["relations"]
+            }
+            
+            # Pass pygame.event.pump to keep window responsive
+            success = self.database.save_document(doc_to_save, event_pump_callback=pygame.event.pump)
+            
+            if success:
+                self.save_status = cfg.STATUS_SAVED
+                self.save_status_time = pygame.time.get_ticks()
+                return True
+            else:
+                self.save_status = "✗ Database save failed"
+                self.save_status_time = pygame.time.get_ticks()
+                return False
+                
+        except Exception as e:
+            self.save_status = f"✗ Error: {str(e)}"
             self.save_status_time = pygame.time.get_ticks()
             print(f"Error saving: {e}")
             return False
     
-    def extract_and_save_entity_types(self):
+    def delete_all_relations(self):
+        """Delete all relations in current document"""
+        if not self.doc["relations"]:
+            self.status_message = "No relations to delete"
+            return
+        
+        # Store for undo
+        old_relations = [sent_rels[:] for sent_rels in self.doc["relations"]]
+        
+        # Clear all relations
+        self.doc["relations"] = [[] for _ in self.doc["sentences"]]
+        
+        # Save to undo stack
+        self.undo_stack.append({
+            "action": "delete_all_relations",
+            "relations": old_relations
+        })
+        self.redo_stack.clear()
+        self.undo_button.is_disabled = False
+        self.redo_button.is_disabled = True
+        
+        # Save and re-render
+        self.save_annotations()
+        self.render_document()
+        self.status_message = "All relations deleted"
+    
+    def export_to_jsonl(self):
+        """Export all database documents to JSONL file"""
+        try:
+            if not self.database or not self.current_file_path:
+                self.status_message = "No database loaded"
+                return
+            
+            # Generate output filename
+            output_path = self.current_file_path.replace('.duckdb', '_export.jsonl')
+            
+            self.status_message = "Exporting to JSONL..."
+            count = self.database.export_to_jsonl(output_path)
+            
+            self.save_status = f"✓ Exported {count} documents to {os.path.basename(output_path)}"
+            self.save_status_time = pygame.time.get_ticks()
+            self.status_message = f"Exported to: {output_path}"
+            print(f"Exported {count} documents to {output_path}")
+            
+        except Exception as e:
+            self.status_message = f"Export failed: {str(e)}"
+            print(f"Export error: {e}")
+    
+    def draw_progress_bar(self, progress, message):
+        """Draw a progress bar overlay"""
+        # Draw the main screen first
+        self.draw()
+        
+        # Semi-transparent background
+        overlay = pygame.Surface((self.width, self.height))
+        overlay.set_alpha(200)
+        overlay.fill((0, 0, 0))
+        self.screen.blit(overlay, (0, 0))
+        
+        # Progress bar dimensions
+        bar_width = 600
+        bar_height = 40
+        bar_x = (self.width - bar_width) // 2
+        bar_y = (self.height - bar_height) // 2
+        
+        # Background
+        pygame.draw.rect(self.screen, (60, 60, 60), (bar_x, bar_y, bar_width, bar_height), border_radius=8)
+        
+        # Progress fill
+        fill_width = int(bar_width * progress)
+        if fill_width > 0:
+            pygame.draw.rect(self.screen, (76, 175, 80), (bar_x, bar_y, fill_width, bar_height), border_radius=8)
+        
+        # Border
+        pygame.draw.rect(self.screen, (180, 180, 180), (bar_x, bar_y, bar_width, bar_height), 2, border_radius=8)
+        
+        # Progress text
+        progress_text = self.font.render(f"{int(progress * 100)}%", True, (255, 255, 255))
+        text_rect = progress_text.get_rect(center=(self.width // 2, bar_y + bar_height // 2))
+        self.screen.blit(progress_text, text_rect)
+        
+        # Message
+        msg_surf = self.small_font.render(message, True, (255, 255, 255))
+        msg_rect = msg_surf.get_rect(center=(self.width // 2, bar_y - 30))
+        self.screen.blit(msg_surf, msg_rect)
+        
+        pygame.display.flip()
+    
+    def extract_and_save_entity_types(self, scan_all_docs=False):
         """Extract unique entity/relation types from documents"""
         entity_types = set()
         relation_types = set()
         
-        for doc in self.document_collection:
-            # Extract entity types from all sentences
+        if scan_all_docs and self.database and self.doc_ids:
+            # Extract from all documents in database (on initial load)
+            print("Scanning all documents for entity and relation types...")
+            total_docs = len(self.doc_ids)
+            
+            for idx, doc_id in enumerate(self.doc_ids):
+                # Update progress bar every 10 documents or on last
+                if idx % 10 == 0 or idx == total_docs - 1:
+                    progress = (idx + 1) / total_docs
+                    self.draw_progress_bar(progress, f"Scanning document {idx + 1}/{total_docs}")
+                    # Process pygame events to keep window responsive
+                    pygame.event.pump()
+                
+                doc = self.database.get_document(doc_id)
+                if doc:
+                    # Extract entity types
+                    for sent_entities in doc.get("ner", []):
+                        for entity in sent_entities:
+                            if len(entity) >= 3:
+                                entity_type = normalize_type(entity[2])
+                                entity_types.add(entity_type)
+                    
+                    # Extract relation types
+                    for sent_relations in doc.get("relations", []):
+                        for relation in sent_relations:
+                            if len(relation) >= 5:
+                                rel_type = normalize_type(relation[4])
+                                relation_types.add(rel_type)
+        else:
+            # Extract from current document only
+            doc = self.doc
+            
+            # Extract entity types
             for sent_entities in doc.get("ner", []):
                 for entity in sent_entities:
                     if len(entity) >= 3:
                         entity_type = normalize_type(entity[2])
                         entity_types.add(entity_type)
             
-            # Extract relation types from all sentences
+            # Extract relation types
             for sent_relations in doc.get("relations", []):
                 for relation in sent_relations:
                     if len(relation) >= 5:
@@ -293,14 +560,11 @@ class EntityAnnotator:
                 if relation_type not in self.relation_colors:
                     self.relation_colors[relation_type] = generate_random_color(relation_type)
         
-        if settings_updated:
-            save_settings(self.settings)
-            
-            # Update popup options
-            self.entity_popup.set_options([{"text": et, "value": et, "color": color}
-                                          for et, color in self.entity_colors.items()])
-            self.relation_popup.set_options([{"text": rt, "value": rt, "color": color}
-                                            for rt, color in self.relation_colors.items()])
+        # Update popup options after processing all types
+        self.entity_popup.set_options([{"text": et, "value": et, "color": color}
+                                      for et, color in self.entity_colors.items()])
+        self.relation_popup.set_options([{"text": rt, "value": rt, "color": color}
+                                        for rt, color in self.relation_colors.items()])
     
     # ========================================================================
     # RENDERING
@@ -317,7 +581,7 @@ class EntityAnnotator:
         if not self.doc or not self.doc["sentences"]:
             return
         
-        line_height = self.font.get_height() + 8
+        line_height = self.font.get_height() + cfg.TOKEN_LINE_HEIGHT_EXTRA
         x = self.doc_container.x + 10
         y = self.doc_container.y - self.doc_scroll_y + 10
         max_line_width = self.doc_container.width - 20
@@ -337,7 +601,8 @@ class EntityAnnotator:
         
         for sent_idx, sentence in enumerate(self.doc["sentences"]):
             if sent_idx > 0:
-                y += 10
+                # Add spacing between sentences
+                y += cfg.SENTENCE_SPACING
                 line_tokens = []
                 line_width = 0
             
@@ -346,7 +611,7 @@ class EntityAnnotator:
                     global_idx += 1
                     continue
                 
-                token_width = self.font.size(token_text)[0] + 4
+                token_width = self.font.size(token_text)[0] + cfg.TOKEN_PADDING
                 
                 # Word wrap
                 if line_width + token_width > max_line_width and line_tokens:
@@ -396,8 +661,6 @@ class EntityAnnotator:
             for relation in sent_relations:
                 if len(relation) >= 5:
                     self._render_relation(relation)
-        
-        save_history(self.undo_stack, self.redo_stack)
     
     def _render_entity(self, entity):
         """Render a single entity"""
@@ -469,6 +732,36 @@ class EntityAnnotator:
         src_center_x, src_center_y = self.get_entity_center(src_entity)
         tgt_center_x, tgt_center_y = self.get_entity_center(tgt_entity)
         
+        # Calculate label position with bounds checking
+        label_x = (src_center_x + tgt_center_x) // 2
+        
+        # Position label above the arrow arc
+        # If entities are on similar vertical positions, place label above
+        # Otherwise place it near the middle of the arc
+        src_top = self.get_entity_top(src_entity)
+        tgt_top = self.get_entity_top(tgt_entity)
+        vertical_diff = abs(src_center_y - tgt_center_y)
+        
+        if vertical_diff < 50:
+            # Entities are roughly horizontally aligned - place label above
+            label_y = min(src_top, tgt_top) - 20
+        else:
+            # Entities are at different heights - place label at midpoint, offset upward
+            label_y = min(src_center_y, tgt_center_y) + (abs(src_center_y - tgt_center_y) // 4) - 30
+        
+        # Keep label within document container bounds
+        label_margin = 30
+        if label_y < self.doc_container.y + label_margin:
+            label_y = min(src_center_y, tgt_center_y) + 20  # Place below if too high
+        if label_y > self.doc_container.bottom - label_margin:
+            label_y = self.doc_container.bottom - label_margin
+        
+        # Keep horizontal position within bounds
+        if label_x < self.doc_container.x + label_margin:
+            label_x = self.doc_container.x + label_margin
+        if label_x > self.doc_container.right - label_margin:
+            label_x = self.doc_container.right - label_margin
+        
         relation_info = {
             "source": src_entity,
             "target": tgt_entity,
@@ -477,41 +770,29 @@ class EntityAnnotator:
             "src_center_x": src_center_x,
             "src_center_y": src_center_y,
             "tgt_center_x": tgt_center_x,
-            "tgt_center_y": tgt_center_y
+            "tgt_center_y": tgt_center_y,
+            "label_x": label_x,
+            "label_y": label_y
         }
         
         self.rendered_relations.append(relation_info)
-        
-        # Add label
-        label_x = (src_center_x + tgt_center_x) // 2
-        label_y = min(self.get_entity_top(src_entity), 
-                     self.get_entity_top(tgt_entity)) - 15
-        
-        label_info = {
-            "text": rel_type,
-            "x": label_x,
-            "y": label_y,
-            "color": self.relation_colors.get(rel_type, (120, 120, 120))
-        }
-        
-        self.rendered_labels.append(label_info)
     
     def draw(self):
-        """Draw the application"""
-        self.screen.fill((240, 240, 240))
+        """Draw the application with modern styling"""
+        # Main background
+        self.screen.fill(cfg.COLOR_BG_MAIN)
         
-        # Toolbar
-        toolbar_rect = pygame.Rect(0, 0, self.width, 160)
-        pygame.draw.rect(self.screen, (220, 220, 220), toolbar_rect)
-        pygame.draw.line(self.screen, (200, 200, 200), (0, 160), (self.width, 160), 2)
+        # Toolbar background
+        toolbar_rect = pygame.Rect(0, 0, self.width, cfg.TOOLBAR_HEIGHT)
+        pygame.draw.rect(self.screen, cfg.COLOR_BG_TOOLBAR, toolbar_rect)
         
-        # Title
-        title_text = self.bold_font.render("Entity Annotator", True, (50, 50, 50))
-        self.screen.blit(title_text, (10, 10))
+        # Subtle shadow under toolbar
+        pygame.draw.line(self.screen, cfg.COLOR_BORDER_LIGHT, 
+                        (0, cfg.TOOLBAR_HEIGHT), (self.width, cfg.TOOLBAR_HEIGHT), 2)
         
-        # Status
-        status_surf = self.font.render(self.status_message[:100], True, (100, 100, 100))
-        self.screen.blit(status_surf, (self.width - status_surf.get_width() - 10, 15))
+        # Status message with secondary text color (no title, just status)
+        status_surf = self.small_font.render(self.status_message[:120], True, cfg.COLOR_TEXT_SECONDARY)
+        self.screen.blit(status_surf, (cfg.TOOLBAR_PADDING, cfg.TOOLBAR_PADDING))
         
         # Draw buttons
         self.undo_button.draw(self.screen)
@@ -522,21 +803,32 @@ class EntityAnnotator:
         self.add_relation_type_button.draw(self.screen)
         self.prev_doc_button.draw(self.screen)
         self.next_doc_button.draw(self.screen)
+        self.export_button.draw(self.screen)
         
         # Navigation bar
-        if self.document_collection:
-            self.navigation_bar.draw(self.screen, self.current_doc_index, 
-                                    len(self.document_collection))
+        total_docs = len(self.doc_ids)
+        if total_docs > 0:
+            self.navigation_bar.draw(self.screen, self.current_doc_index, total_docs)
         
-        # Save status
+        # Save status with modern styling
         current_time = pygame.time.get_ticks()
-        if self.save_status and current_time - self.save_status_time < 3000:
-            save_surf = self.font.render(self.save_status, True, (0, 150, 0))
-            self.screen.blit(save_surf, (self.width - save_surf.get_width() - 10, 45))
+        if self.save_status and current_time - self.save_status_time < cfg.SHOW_SAVE_NOTIFICATION_DURATION:
+            # Determine color based on status
+            if "✓" in self.save_status or "success" in self.save_status.lower():
+                status_color = cfg.COLOR_SUCCESS
+            elif "✗" in self.save_status or "error" in self.save_status.lower():
+                status_color = cfg.COLOR_DANGER
+            else:
+                status_color = cfg.COLOR_INFO
+            
+            save_surf = self.small_font.render(self.save_status, True, status_color)
+            # Position in top-right
+            self.screen.blit(save_surf, (self.width - save_surf.get_width() - cfg.TOOLBAR_PADDING, 
+                                        cfg.TOOLBAR_PADDING))
         
-        # Document container
-        pygame.draw.rect(self.screen, (255, 255, 255), self.doc_container)
-        pygame.draw.rect(self.screen, (200, 200, 200), self.doc_container, 1)
+        # Document container with modern styling
+        pygame.draw.rect(self.screen, cfg.COLOR_BG_DOCUMENT, self.doc_container, border_radius=8)
+        pygame.draw.rect(self.screen, cfg.COLOR_BORDER_LIGHT, self.doc_container, 1, border_radius=8)
         
         # Draw document content
         original_clip = self.screen.get_clip()
@@ -544,17 +836,23 @@ class EntityAnnotator:
         self.draw_document_content()
         self.screen.set_clip(original_clip)
         
-        # Scrollbar
+        # Modern scrollbar
         if self.max_scroll_y > 0:
-            scrollbar_height = max(30, min(self.doc_container.height,
+            scrollbar_height = max(40, min(self.doc_container.height,
                 self.doc_container.height * self.doc_container.height / 
                 (self.doc_container.height + self.max_scroll_y)))
             scrollbar_pos = self.doc_container.y + (self.doc_container.height - scrollbar_height) * \
                            (self.doc_scroll_y / self.max_scroll_y)
             
-            scrollbar_rect = pygame.Rect(self.doc_container.right - 10, scrollbar_pos, 
-                                        10, scrollbar_height)
-            pygame.draw.rect(self.screen, (200, 200, 200), scrollbar_rect, border_radius=5)
+            # Scrollbar track (background)
+            track_rect = pygame.Rect(self.doc_container.right - 12, self.doc_container.y,
+                                    8, self.doc_container.height)
+            pygame.draw.rect(self.screen, cfg.COLOR_BORDER_LIGHT, track_rect, border_radius=4)
+            
+            # Scrollbar thumb
+            scrollbar_rect = pygame.Rect(self.doc_container.right - 12, scrollbar_pos, 
+                                        8, scrollbar_height)
+            pygame.draw.rect(self.screen, cfg.COLOR_SCROLLBAR, scrollbar_rect, border_radius=4)
         
         # Popups and dialogs
         self.entity_popup.draw(self.screen)
@@ -571,9 +869,20 @@ class EntityAnnotator:
         pygame.display.flip()
     
     def draw_document_content(self):
-        """Draw document tokens, entities, and relations"""
-        # Draw tokens
-        for token in self.rendered_tokens:
+        """Draw document tokens, entities, and relations - OPTIMIZED"""
+        # Calculate visible range for virtual scrolling
+        if cfg.ENABLE_VIRTUAL_SCROLLING:
+            visible_top = self.doc_container.y - cfg.VIEWPORT_BUFFER
+            visible_bottom = self.doc_container.bottom + cfg.VIEWPORT_BUFFER
+            
+            # Filter to only visible tokens (HUGE performance boost)
+            visible_tokens = [t for t in self.rendered_tokens 
+                            if visible_top <= t["rect"].y <= visible_bottom]
+        else:
+            visible_tokens = self.rendered_tokens
+        
+        # Draw only visible tokens
+        for token in visible_tokens:
             if self.doc_container.y <= token["rect"].y < self.doc_container.bottom:
                 text_surf = self.font.render(token["text"], True, (0, 0, 0))
                 self.screen.blit(text_surf, token["rect"])
@@ -586,36 +895,41 @@ class EntityAnnotator:
                                    border_radius=3)
                     self.screen.blit(highlight, token["rect"])
         
-        # Draw entities
-        for entity in self.rendered_entities:
+        # Draw entities (only visible ones)
+        if cfg.ENABLE_VIRTUAL_SCROLLING:
+            visible_entities = []
+            for entity in self.rendered_entities:
+                # Check if entity is in visible range
+                entity_rects = [entity["rect"]] if isinstance(entity["rect"], pygame.Rect) else entity["rect"]["rects"]
+                for rect in (entity_rects if isinstance(entity["rect"], dict) and entity["rect"].get("multi_line") else [entity["rect"]]):
+                    if visible_top <= rect.y <= visible_bottom:
+                        visible_entities.append(entity)
+                        break
+        else:
+            visible_entities = self.rendered_entities
+        
+        for entity in visible_entities:
             self.draw_entity_background(entity)
         
         # Draw relations (only for hovered entity)
         if self.hovered_entity_key:
-            # Collect relations connected to the hovered entity
-            connected_relations = []
+            # Draw relations connected to the hovered entity
             for relation in self.rendered_relations:
                 src_key = f"{relation['source']['start']}-{relation['source']['end']}"
                 tgt_key = f"{relation['target']['start']}-{relation['target']['end']}"
                 
                 if src_key == self.hovered_entity_key or tgt_key == self.hovered_entity_key:
-                    connected_relations.append(relation)
+                    # Draw arrow
                     self.draw_relation_arrow(relation)
-            
-            # Draw labels only for the connected relations
-            for relation in connected_relations:
-                src_center_x = relation["src_center_x"]
-                tgt_center_x = relation["tgt_center_x"]
-                expected_label_x = (src_center_x + tgt_center_x) // 2
-                relation_type = relation["type"]
-                
-                # Find the label that matches this specific relation
-                for label in self.rendered_labels:
-                    if label["text"] == relation_type:
-                        # Check if label position is close to this relation's expected position
-                        if abs(label["x"] - expected_label_x) < 100:
-                            self.draw_relation_label(label)
-                            break
+                    
+                    # Draw label with the relation
+                    label_info = {
+                        "text": relation["type"],
+                        "x": relation["label_x"],
+                        "y": relation["label_y"],
+                        "color": relation["color"]
+                    }
+                    self.draw_relation_label(label_info)
         
         # Draw temp relation line
         if self.dragging_relation and self.temp_line:
@@ -646,34 +960,73 @@ class EntityAnnotator:
                 self.screen.blit(text_surf, text_rect)
     
     def draw_entity_background(self, entity_info):
-        """Draw entity background rectangle"""
+        """Draw entity background rectangle with enhanced hover effects"""
         entity_type = normalize_type(entity_info["type"])
-        bg_color = self.entity_colors.get(entity_type, (200, 200, 200))
-        bg_color_alpha = (bg_color[0], bg_color[1], bg_color[2], 100)
+        bg_color = self.entity_colors.get(entity_type, cfg.COLOR_SECONDARY)
         
+        # Adjust opacity based on state
+        if entity_info["hovered"]:
+            bg_alpha = 160  # More opaque on hover
+        elif entity_info["selected"]:
+            bg_alpha = 140  # Medium opacity for selected
+        else:
+            bg_alpha = 100  # Light opacity for normal
+        
+        bg_color_alpha = (*bg_color[:3], bg_alpha)
+        
+        # Get all rectangles (handle multi-line entities)
         rects = [entity_info["rect"]] if isinstance(entity_info["rect"], pygame.Rect) else entity_info["rect"]["rects"]
         
         for rect in (rects if isinstance(entity_info["rect"], dict) and entity_info["rect"].get("multi_line") else [entity_info["rect"]]):
+            # Draw background with alpha
             entity_surface = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
-            pygame.draw.rect(entity_surface, bg_color_alpha, (0, 0, rect.width, rect.height), border_radius=3)
+            pygame.draw.rect(entity_surface, bg_color_alpha, 
+                           (0, 0, rect.width, rect.height), 
+                           border_radius=cfg.ENTITY_BORDER_RADIUS)
             self.screen.blit(entity_surface, rect)
             
-            border_width = 2 if (entity_info["hovered"] or entity_info["selected"]) else 1
-            pygame.draw.rect(self.screen, bg_color, rect, border_width, border_radius=3)
+            # Draw border - slightly thicker on hover/selection
+            if entity_info["hovered"] or entity_info["selected"]:
+                border_width = 2
+                border_color = bg_color  # Full color for border
+            else:
+                border_width = 1
+                border_color = bg_color  # Full color always
+            
+            pygame.draw.rect(self.screen, border_color, rect, border_width, 
+                           border_radius=cfg.ENTITY_BORDER_RADIUS)
     
     def draw_relation_arrow(self, relation):
-        """Draw relation arrow"""
+        """Draw relation arrow with smart curve adjustment"""
         src_x, src_y = relation["src_center_x"], relation["src_center_y"]
         tgt_x, tgt_y = relation["tgt_center_x"], relation["tgt_center_y"]
         
         distance = math.sqrt((tgt_x - src_x)**2 + (tgt_y - src_y)**2)
         height_factor = min(100, distance / 4)
         
+        # Check if we're near the top of the container
+        min_y = min(src_y, tgt_y)
+        max_y = max(src_y, tgt_y)
+        near_top = min_y - height_factor < self.doc_container.y + 30
+        near_bottom = max_y + height_factor > self.doc_container.bottom - 30
+        
         if abs(tgt_y - src_y) < 50:
             ctrl_x1 = src_x + (tgt_x - src_x) * 0.25
-            ctrl_y1 = src_y - height_factor
             ctrl_x2 = src_x + (tgt_x - src_x) * 0.75
-            ctrl_y2 = tgt_y - height_factor
+            
+            # Adjust curve direction based on space available
+            if near_top and not near_bottom:
+                # Curve downward instead
+                ctrl_y1 = src_y + height_factor * 0.5
+                ctrl_y2 = tgt_y + height_factor * 0.5
+            elif near_bottom and not near_top:
+                # Curve upward (more)
+                ctrl_y1 = src_y - height_factor * 1.2
+                ctrl_y2 = tgt_y - height_factor * 1.2
+            else:
+                # Normal upward curve
+                ctrl_y1 = src_y - height_factor
+                ctrl_y2 = tgt_y - height_factor
         else:
             ctrl_x1 = src_x + (tgt_x - src_x) * 0.25
             ctrl_y1 = src_y + (tgt_y - src_y) * 0.25
@@ -710,18 +1063,29 @@ class EntityAnnotator:
             pygame.draw.polygon(self.screen, relation["color"], [p2, a1, a2])
     
     def draw_relation_label(self, label):
-        """Draw relation label"""
-        if self.doc_container.y < label["y"] < self.doc_container.bottom:
-            text_surf = self.small_font.render(label["text"], True, label["color"])
-            text_rect = text_surf.get_rect(center=(label["x"], label["y"]))
+        """Draw relation label with bounds clamping"""
+        # Clamp label position to visible area
+        label_x = max(self.doc_container.x + 40, 
+                     min(label["x"], self.doc_container.right - 40))
+        label_y = max(self.doc_container.y + 20, 
+                     min(label["y"], self.doc_container.bottom - 20))
+        
+        # Check if label is within extended visible area
+        padding = 50
+        if (self.doc_container.y - padding <= label_y <= self.doc_container.bottom + padding and
+            self.doc_container.x - padding <= label_x <= self.doc_container.right + padding):
+            
+            text_surf = self.small_font.render(label["text"], True, (0, 0, 0))
+            text_rect = text_surf.get_rect(center=(label_x, label_y))
             
             bg_rect = text_rect.copy()
-            bg_rect.inflate_ip(6, 6)
+            bg_rect.inflate_ip(8, 6)
             
-            bg_surf = pygame.Surface((bg_rect.width, bg_rect.height))
-            bg_surf.fill((255, 255, 255))
-            bg_surf.set_alpha(220)
-            self.screen.blit(bg_surf, bg_rect)
+            # Draw white background with border
+            pygame.draw.rect(self.screen, (255, 255, 255), bg_rect, border_radius=3)
+            pygame.draw.rect(self.screen, label["color"], bg_rect, 2, border_radius=3)
+            
+            # Draw text
             self.screen.blit(text_surf, text_rect)
     
     def calculate_bezier_points(self, points, num_points=20):
@@ -807,9 +1171,13 @@ class EntityAnnotator:
         
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                self.save_annotations()
-                save_settings(self.settings)
-                save_history(self.undo_stack, self.redo_stack)
+                # Quick cleanup - no need to save (auto-saved after each change)
+                try:
+                    if self.database:
+                        self.database.close()
+                except Exception as e:
+                    print(f"Error closing database: {e}")
+                
                 return False
             
             elif event.type == pygame.VIDEORESIZE:
@@ -869,9 +1237,14 @@ class EntityAnnotator:
             elif self.relation_popup.visible and self.relation_popup.rect.collidepoint(pos):
                 self.relation_popup.handle_scroll(scroll_dir)
             elif self.doc_container.collidepoint(pos):
-                self.doc_scroll_y = max(0, min(self.max_scroll_y, 
-                                     self.doc_scroll_y - scroll_dir * 30))
-                self.render_document()
+                # Scrolling (works with virtual scrolling for performance)
+                if cfg.ENABLE_SMOOTH_SCROLLING:
+                    self.target_scroll_y = max(0, min(self.max_scroll_y, 
+                                         self.target_scroll_y - scroll_dir * cfg.SCROLL_SPEED))
+                else:
+                    self.doc_scroll_y = max(0, min(self.max_scroll_y, 
+                                         self.doc_scroll_y - scroll_dir * cfg.SCROLL_SPEED))
+                    self.render_document()  # Re-render with new scroll position
             return
         
         # Handle button clicks
@@ -880,13 +1253,15 @@ class EntityAnnotator:
         elif self.redo_button.click(pos) and not self.redo_button.is_disabled:
             self.redo()
         elif self.save_button.click(pos):
-            self.save_annotations()
+            self.save_annotations(show_immediate_feedback=True)
         elif self.open_file_button.click(pos):
             self.file_browser.show(self.current_file_path if self.current_file_path else None)
         elif self.prev_doc_button.click(pos) and not self.prev_doc_button.is_disabled:
             self.load_document(self.current_doc_index - 1)
         elif self.next_doc_button.click(pos) and not self.next_doc_button.is_disabled:
             self.load_document(self.current_doc_index + 1)
+        elif self.export_button.click(pos):
+            self.export_to_jsonl()
         elif self.add_entity_type_button.click(pos):
             self.input_dialog.title = "Add New Entity Type"
             self.input_dialog.show(self.width // 2 - 175, self.height // 2 - 90)
@@ -1002,6 +1377,7 @@ class EntityAnnotator:
         self.next_doc_button.check_hover(pos)
         self.add_entity_type_button.check_hover(pos)
         self.add_relation_type_button.check_hover(pos)
+        self.export_button.check_hover(pos)
         
         # Handle token selection
         if self.is_selecting and self.selection_start_token:
@@ -1013,6 +1389,7 @@ class EntityAnnotator:
                 self.render_document()
         
         # Update entity hover states
+        hovered_entity_found = False
         for entity in self.rendered_entities:
             was_hovered = entity["hovered"]
             
@@ -1027,10 +1404,13 @@ class EntityAnnotator:
             
             entity["hovered"] = is_hovered
             
-            if entity["hovered"] and not was_hovered:
+            if entity["hovered"]:
                 self.hovered_entity_key = f"{entity['start']}-{entity['end']}"
-            elif was_hovered and not entity["hovered"]:
-                self.hovered_entity_key = None
+                hovered_entity_found = True
+        
+        # Clear hover state if no entity is hovered
+        if not hovered_entity_found:
+            self.hovered_entity_key = None
         
         # Update relation drag line
         if self.dragging_relation and self.temp_line:
@@ -1059,7 +1439,8 @@ class EntityAnnotator:
         
         # Navigation bar input
         if self.navigation_bar.jump_active:
-            result = self.navigation_bar.handle_key(event, len(self.document_collection))
+            total_docs = len(self.doc_ids)
+            result = self.navigation_bar.handle_key(event, total_docs)
             if result is not None:
                 self.load_document(result)
             return
@@ -1105,6 +1486,7 @@ class EntityAnnotator:
         
         # Arrow keys - Navigate documents
         elif event.key == pygame.K_LEFT:
+            total_docs = len(self.doc_ids)
             if mods & pygame.KMOD_CTRL:
                 new_idx = max(0, self.current_doc_index - 10)
                 self.load_document(new_idx)
@@ -1113,8 +1495,9 @@ class EntityAnnotator:
                     self.load_document(self.current_doc_index - 1)
         
         elif event.key == pygame.K_RIGHT:
+            total_docs = len(self.doc_ids)
             if mods & pygame.KMOD_CTRL:
-                new_idx = min(len(self.document_collection) - 1, self.current_doc_index + 10)
+                new_idx = min(total_docs - 1, self.current_doc_index + 10)
                 self.load_document(new_idx)
             else:
                 if not self.next_doc_button.is_disabled:
@@ -1125,16 +1508,23 @@ class EntityAnnotator:
             self.load_document(0)
         
         elif event.key == pygame.K_END:
-            self.load_document(len(self.document_collection) - 1)
+            total_docs = len(self.doc_ids)
+            self.load_document(total_docs - 1)
         
         # Page Up/Down - Scroll
         elif event.key == pygame.K_PAGEUP:
-            self.doc_scroll_y = max(0, self.doc_scroll_y - 100)
-            self.render_document()
+            if cfg.ENABLE_SMOOTH_SCROLLING:
+                self.target_scroll_y = max(0, self.target_scroll_y - 150)
+            else:
+                self.doc_scroll_y = max(0, self.doc_scroll_y - 150)
+                self.render_document()
         
         elif event.key == pygame.K_PAGEDOWN:
-            self.doc_scroll_y = min(self.max_scroll_y, self.doc_scroll_y + 100)
-            self.render_document()
+            if cfg.ENABLE_SMOOTH_SCROLLING:
+                self.target_scroll_y = min(self.max_scroll_y, self.target_scroll_y + 150)
+            else:
+                self.doc_scroll_y = min(self.max_scroll_y, self.doc_scroll_y + 150)
+                self.render_document()
         
         # D - Delete
         elif event.key == pygame.K_d:
@@ -1370,7 +1760,6 @@ class EntityAnnotator:
             "color": color
         })
         
-        save_settings(self.settings)
         self.status_message = f"Added entity type: {entity_type}"
         return True
     
@@ -1393,7 +1782,6 @@ class EntityAnnotator:
             "color": color
         })
         
-        save_settings(self.settings)
         self.status_message = f"Added relation type: {relation_type}"
         return True
     
@@ -1497,12 +1885,50 @@ class EntityAnnotator:
     # ========================================================================
     
     def run(self):
-        """Main application loop"""
+        """Main application loop with smooth animations"""
         running = True
+        first_frame = True
+        
         while running:
             running = self.handle_events()
+            
+            # Load deferred file after first frame (prevents startup freeze)
+            if first_frame:
+                first_frame = False
+                self.draw()  # Render empty window first
+                pygame.display.flip()
+                
+                if self.pending_file_load:
+                    try:
+                        self.load_file(self.pending_file_load)
+                    except Exception as e:
+                        print(f"Error loading initial file: {e}")
+                        self.status_message = f"Error loading file: {str(e)}"
+                    finally:
+                        self.pending_file_load = None
+                elif not self.doc_ids:
+                    # No file loaded - open file browser automatically
+                    self.file_browser.show()
+            
+            # Update smooth scrolling
+            if cfg.ENABLE_SMOOTH_SCROLLING and abs(self.target_scroll_y - self.doc_scroll_y) > 0.5:
+                # Smooth interpolation
+                scroll_diff = self.target_scroll_y - self.doc_scroll_y
+                self.doc_scroll_y += scroll_diff * cfg.SMOOTH_SCROLL_FACTOR
+                
+                # Clamp to valid range
+                self.doc_scroll_y = max(0, min(self.max_scroll_y, self.doc_scroll_y))
+                
+                # Re-render with new scroll position (virtual scrolling makes this fast)
+                self.render_document()
+            elif cfg.ENABLE_SMOOTH_SCROLLING:
+                # Snap to target when close enough
+                if self.doc_scroll_y != self.target_scroll_y:
+                    self.doc_scroll_y = self.target_scroll_y
+                    self.render_document()
+            
             self.draw()
-            self.clock.tick(60)
+            self.clock.tick(cfg.FPS)
         
         pygame.quit()
         sys.exit()
