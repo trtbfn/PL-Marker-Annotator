@@ -2,6 +2,8 @@
 
 An annotation tool for Named Entity Recognition (NER) and Relation Extraction tasks. Built with Python and Pygame, featuring DuckDB storage.
 
+# Presentation
+[presentation](https://github.com/trtbfn/PL-Marker-Annotator/blob/main/PL-Marker_annotation_tool_presentation.pdf) (russian). Project have been presented on [conference-biennale "Information Technologies in Humanitarian Research"](http://dhri.ru/wp-content/uploads/2025/11/SFU-DH-2025.pdf). 
 
 ## 📦 Quick Start
 
